@@ -6,9 +6,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
+#include <string>
 #include <vector>
 
 #include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
 
 #include "color.hpp"
 #include "config.hpp"
@@ -58,6 +60,117 @@ int boardNumberContrast(const cv::Mat& bgr, const LightBar& left, const LightBar
   const int background = percentile(0.40);
   const int foreground = percentile(0.65);
   return foreground - background;
+}
+
+bool estimatePanelOutline(const cv::Point2f lightCorners[4], cv::Point2f panelCorners[4])
+{
+  const cv::Mat camera = (cv::Mat_<double>(3, 3) <<
+      cfg::kFx, 0.0, cfg::kCx, 0.0, cfg::kFy, cfg::kCy, 0.0, 0.0, 1.0);
+  const cv::Mat distortion = (cv::Mat_<double>(5, 1) <<
+      cfg::kK1, cfg::kK2, cfg::kP1, cfg::kP2, cfg::kK3);
+  std::vector<cv::Point2f> normalizedAnchors;
+  cv::undistortPoints(std::vector<cv::Point2f>(lightCorners, lightCorners + 4),
+                      normalizedAnchors, camera, distortion);
+  const cv::Point2f anchorModel[] = {{-63.5f, -25.f}, {63.5f, -25.f},
+                                      {63.5f, 25.f}, {-63.5f, 25.f}};
+  const cv::Point2f panelModel[] = {{-67.5f, -28.f}, {67.5f, -28.f},
+                                     {67.5f, 28.f}, {-67.5f, 28.f}};
+  const cv::Mat transform = cv::getPerspectiveTransform(anchorModel, normalizedAnchors.data());
+  std::vector<cv::Point2f> normalizedPanel;
+  cv::perspectiveTransform(std::vector<cv::Point2f>(panelModel, panelModel + 4),
+                           normalizedPanel, transform);
+  std::vector<cv::Point3f> rays;
+  for (const auto& point : normalizedPanel) rays.emplace_back(point.x, point.y, 1.0f);
+  std::vector<cv::Point2f> imagePanel;
+  cv::projectPoints(rays, cv::Vec3d(), cv::Vec3d(), camera, distortion, imagePanel);
+  if (imagePanel.size() != 4) return false;
+  std::copy(imagePanel.begin(), imagePanel.end(), panelCorners);
+  return true;
+}
+
+struct PanelEdgeFit {
+  bool detected = false;
+  float offset = 0.f;
+  float support = 0.f;
+  float coherence = 0.f;
+  float polarity = 0.f;
+};
+
+PanelEdgeFit fitEnhancedEdge(const cv::Mat& gradient, bool horizontal, int center,
+                             int extent, int firstOffset, int lastOffset)
+{
+  constexpr float gradientThreshold = 32.f;
+  std::vector<int> strongOffsets, polarities;
+  int samples = 0;
+  for (int p = extent / 6; p < extent * 5 / 6; p += 2) {
+    float bestMagnitude = 0.f;
+    int bestOffset = 0, bestPolarity = 0;
+    for (int offset = firstOffset; offset <= lastOffset; ++offset) {
+      const int x = horizontal ? p : center + offset;
+      const int y = horizontal ? center + offset : p;
+      if (x < 0 || x >= gradient.cols || y < 0 || y >= gradient.rows) continue;
+      const float value = gradient.at<float>(y, x);
+      if (std::abs(value) > bestMagnitude) {
+        bestMagnitude = std::abs(value);
+        bestOffset = offset;
+        bestPolarity = (value > 0.f) - (value < 0.f);
+      }
+    }
+    ++samples;
+    if (bestMagnitude >= gradientThreshold) {
+      strongOffsets.push_back(bestOffset);
+      polarities.push_back(bestPolarity);
+    }
+  }
+  PanelEdgeFit fit;
+  if (samples == 0 || strongOffsets.empty()) return fit;
+  fit.support = static_cast<float>(strongOffsets.size()) / samples;
+  auto middle = strongOffsets.begin() + strongOffsets.size() / 2;
+  std::nth_element(strongOffsets.begin(), middle, strongOffsets.end());
+  fit.offset = static_cast<float>(*middle);
+  const int aligned = static_cast<int>(std::count_if(strongOffsets.begin(), strongOffsets.end(),
+      [&](int offset) { return std::abs(offset - static_cast<int>(fit.offset)) <= 2; }));
+  fit.coherence = static_cast<float>(aligned) / strongOffsets.size();
+  const int positive = static_cast<int>(std::count_if(polarities.begin(), polarities.end(),
+      [](int polarity) { return polarity > 0; }));
+  const int negative = static_cast<int>(polarities.size()) - positive;
+  fit.polarity = static_cast<float>(std::max(positive, negative)) / polarities.size();
+  fit.detected = fit.support >= 0.35f && fit.coherence >= 0.70f && fit.polarity >= 0.65f;
+  return fit;
+}
+
+void detectPanelOutlineWithClahe(const cv::Mat& bgr, Armor& armor)
+{
+  if (!estimatePanelOutline(armor.corners, armor.panelCorners)) return;
+  armor.panelOutlineValid = true;
+  constexpr int width = 324, height = 140;
+  const cv::Point2f target[] = {{27, 14}, {296, 14}, {296, 125}, {27, 125}};
+  const cv::Mat transform = cv::getPerspectiveTransform(armor.panelCorners, target);
+  cv::Mat rectified, gray, enhanced, gradX, gradY;
+  cv::warpPerspective(bgr, rectified, transform, {width, height});
+  cv::cvtColor(rectified, gray, cv::COLOR_BGR2GRAY);
+  cv::createCLAHE(4.0, cv::Size(8, 8))->apply(gray, enhanced);
+  cv::Sobel(enhanced, gradX, CV_32F, 1, 0, 3);
+  cv::Sobel(enhanced, gradY, CV_32F, 0, 1, 3);
+  const PanelEdgeFit edges[] = {
+      fitEnhancedEdge(gradY, true, 14, width, -8, 4),
+      fitEnhancedEdge(gradX, false, 296, height, -4, 8),
+      fitEnhancedEdge(gradY, true, 125, width, -4, 8),
+      fitEnhancedEdge(gradX, false, 27, height, -8, 4)};
+  for (int i = 0; i < 4; ++i) armor.panelDetectedEdges[i] = edges[i].detected;
+  const cv::Point2f refined[] = {
+      {27.f + (edges[3].detected ? edges[3].offset : 0.f), 14.f + (edges[0].detected ? edges[0].offset : 0.f)},
+      {296.f + (edges[1].detected ? edges[1].offset : 0.f), 14.f + (edges[0].detected ? edges[0].offset : 0.f)},
+      {296.f + (edges[1].detected ? edges[1].offset : 0.f), 125.f + (edges[2].detected ? edges[2].offset : 0.f)},
+      {27.f + (edges[3].detected ? edges[3].offset : 0.f), 125.f + (edges[2].detected ? edges[2].offset : 0.f)}};
+  std::vector<cv::Point2f> imagePoints;
+  cv::perspectiveTransform(std::vector<cv::Point2f>(refined, refined + 4), imagePoints, transform.inv());
+  if (imagePoints.size() == 4) std::copy(imagePoints.begin(), imagePoints.end(), armor.panelCorners);
+  armor.panelDetectedCorners[0] = edges[0].detected && edges[3].detected;
+  armor.panelDetectedCorners[1] = edges[0].detected && edges[1].detected;
+  armor.panelDetectedCorners[2] = edges[1].detected && edges[2].detected;
+  armor.panelDetectedCorners[3] = edges[2].detected && edges[3].detected;
+  armor.panelEdgeConfidence = (edges[0].support + edges[1].support + edges[2].support + edges[3].support) * 0.25f;
 }
 
 // 取灯条朝外那一条长边的两个端点（leftBar=true 取向左突出的那条）
@@ -274,9 +387,46 @@ bool buildBar(const cv::Mat& bgr, const cv::Mat& mask, const std::vector<cv::Poi
   }
 
   const bool barOk = area >= cfg::kMinBarArea && ratioOk && lenOk && tiltOk && rgOk && rbOk;
+  bar.partial = !barOk && tiltOk && rgOk && rbOk;
   if (tiltOk && rgOk && rbOk && bar.len >= cfg::kMinFragmentLen && bar.ratio >= 1.25f)
     fragments.push_back(bar);
   return barOk;
+}
+
+bool extrapolatePartialEndpoint(const LightBar& partial, const LightBar& reference,
+                                LightBar& completed, bool& inferredTopEndpoint)
+{
+  if (!partial.partial || reference.partial || reference.len < cfg::kMinBarLen) return false;
+  const float visibleRatio = partial.len / reference.len;
+  if (visibleRatio < 0.40f || visibleRatio > 0.88f) return false;
+  if (partial.wid < 0.60f * reference.wid || partial.wid > 1.70f * reference.wid) return false;
+  if (std::fabs(partial.tiltDeg - reference.tiltDeg) > 10.0f) return false;
+
+  const cv::Point2f axis = (reference.axisBottom - reference.axisTop) / reference.len;
+  const cv::Point2f perpendicular(-axis.y, axis.x);
+  const cv::Point2f centerDelta = partial.center - reference.center;
+  const cv::Point2f across = perpendicular * centerDelta.dot(perpendicular);
+  const cv::Point2f expectedTop = reference.axisTop + across;
+  const cv::Point2f expectedBottom = reference.axisBottom + across;
+  const float topError = static_cast<float>(cv::norm(partial.axisTop - expectedTop));
+  const float bottomError = static_cast<float>(cv::norm(partial.axisBottom - expectedBottom));
+  const float alignmentLimit = std::max(4.0f, 1.5f * std::max(partial.wid, reference.wid));
+  if (std::min(topError, bottomError) > alignmentLimit) return false;
+  inferredTopEndpoint = bottomError < topError;
+
+  completed = partial;
+  completed.axisTop = expectedTop;
+  completed.axisBottom = expectedBottom;
+  completed.center = (expectedTop + expectedBottom) * 0.5f;
+  completed.len = reference.len;
+  completed.wid = partial.wid;
+  completed.rect = cv::RotatedRect(completed.center,
+      {completed.len, completed.wid},
+      static_cast<float>(std::atan2(axis.y, axis.x) * 180.0 / kPi));
+  completed.partial = false;
+  completed.extrapolatedEndpoint = true;
+  completed.extrapolatedTopEndpoint = inferredTopEndpoint;
+  return setBarGeometry(completed);
 }
 
 bool joinFragments(const LightBar& upper, const LightBar& lower, LightBar& joined)
@@ -338,6 +488,9 @@ DetectResult detect(const cv::Mat& bgr, int maskMode)
       if (joinFragments(upper, lower, joined)) res.bars.push_back(joined);
     }
   }
+  for (const auto& fragment : fragments) {
+    if (fragment.partial) res.bars.push_back(fragment);
+  }
 
   // 从左到右排序，装甲板左右灯条必然一左一右
   std::sort(res.bars.begin(), res.bars.end(),
@@ -346,8 +499,27 @@ DetectResult detect(const cv::Mat& bgr, int maskMode)
   // 两两配对粗筛
   for (size_t i = 0; i < res.bars.size(); ++i) {
     for (size_t j = i + 1; j < res.bars.size(); ++j) {
-      const LightBar& l = res.bars[i];
-      const LightBar& r = res.bars[j];
+      const LightBar& detectedLeft = res.bars[i];
+      const LightBar& detectedRight = res.bars[j];
+      if (detectedLeft.partial && detectedRight.partial) continue;
+      LightBar recoveredLeft, recoveredRight;
+      bool inferredLeftTop = false, inferredRightTop = false;
+      const LightBar* leftCandidate = &detectedLeft;
+      const LightBar* rightCandidate = &detectedRight;
+      bool extrapolated = false;
+      if (detectedLeft.partial) {
+        if (!extrapolatePartialEndpoint(detectedLeft, detectedRight, recoveredLeft,
+                                        inferredLeftTop)) continue;
+        leftCandidate = &recoveredLeft;
+        extrapolated = true;
+      } else if (detectedRight.partial) {
+        if (!extrapolatePartialEndpoint(detectedRight, detectedLeft, recoveredRight,
+                                        inferredRightTop)) continue;
+        rightCandidate = &recoveredRight;
+        extrapolated = true;
+      }
+      const LightBar& l = *leftCandidate;
+      const LightBar& r = *rightCandidate;
       if (r.joinedFragments) continue;
 
       const double maxLen = std::max(l.len, r.len);
@@ -361,7 +533,8 @@ DetectResult detect(const cv::Mat& bgr, int maskMode)
       a.gapRatio = gap > 1e-3 ? static_cast<float>(gap / maxLen) : 0.f;
       a.slope = gap > 1e-3 ? static_cast<float>(std::fabs(dc.y) / gap) : 1.f;
 
-      const bool lenOk = a.lenDiff <= (l.joinedFragments ? cfg::kMaxRecoveredLenDiff : cfg::kMaxLenDiff);
+      const bool lenOk = a.lenDiff <= ((l.joinedFragments || r.joinedFragments || extrapolated)
+                                           ? cfg::kMaxRecoveredLenDiff : cfg::kMaxLenDiff);
       const bool gapOk = a.gapRatio >= cfg::kMinGapRatio && a.gapRatio <= cfg::kMaxGapRatio;
       const bool slopeOk = a.slope <= cfg::kMaxSlope;
       const bool parOk = std::fabs(l.tiltDeg - r.tiltDeg) <= 20.0f;
@@ -379,7 +552,8 @@ DetectResult detect(const cv::Mat& bgr, int maskMode)
       }
       if (!lenOk || !gapOk || !slopeOk || !parOk || !areaOk) continue;
 
-      if (l.joinedFragments || a.gapRatio > cfg::kWidePairGapRatio) {
+      if (l.joinedFragments || r.joinedFragments || extrapolated ||
+          a.gapRatio > cfg::kWidePairGapRatio) {
         const int numberContrast = boardNumberContrast(bgr, l, r);
         const bool boardOk = numberContrast >= cfg::kMinBoardNumberContrast;
         if (verbose()) {
@@ -391,12 +565,19 @@ DetectResult detect(const cv::Mat& bgr, int maskMode)
 
       a.left = l;
       a.right = r;
+      a.partialBarInferred = extrapolated;
       if (cfg::g_tune.centerCorners) {
         // 用灯条中线端点：灯条侧边粘了亮斑、或一端被遮住时，中线比外缘稳
         a.corners[0] = a.left.axisTop;
         a.corners[1] = a.right.axisTop;
         a.corners[2] = a.right.axisBottom;
         a.corners[3] = a.left.axisBottom;
+        if (a.left.extrapolatedEndpoint) {
+          a.inferredCorners[a.left.extrapolatedTopEndpoint ? 0 : 3] = true;
+        }
+        if (a.right.extrapolatedEndpoint) {
+          a.inferredCorners[a.right.extrapolatedTopEndpoint ? 1 : 2] = true;
+        }
       } else {
         outerEdge(a.left, true, &a.left.outerTop, &a.left.outerBottom);
         outerEdge(a.right, false, &a.right.outerTop, &a.right.outerBottom);
@@ -404,9 +585,18 @@ DetectResult detect(const cv::Mat& bgr, int maskMode)
         a.corners[1] = a.right.outerTop;
         a.corners[2] = a.right.outerBottom;
         a.corners[3] = a.left.outerBottom;
+        if (a.left.extrapolatedEndpoint) {
+          a.inferredCorners[a.left.extrapolatedTopEndpoint ? 0 : 3] = true;
+        }
+        if (a.right.extrapolatedEndpoint) {
+          a.inferredCorners[a.right.extrapolatedTopEndpoint ? 1 : 2] = true;
+        }
       }
+      if (const char* enabled = std::getenv("AIM_PANEL_EDGES"); enabled &&
+          std::string(enabled) == "1")
+        detectPanelOutlineWithClahe(bgr, a);
       a.center = (l.center + r.center) * 0.5f;
-      a.score = a.lenDiff + a.slope;
+      a.score = a.lenDiff + a.slope + (extrapolated ? 0.15f : 0.0f);
       if (verbose() && l.joinedFragments) {
         std::printf("  [fragment] left=(%.1f, %.1f) span=%.1f, right=(%.1f, %.1f)\n",
                     l.center.x, l.center.y, l.len, r.center.x, r.center.y);

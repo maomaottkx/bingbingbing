@@ -5,6 +5,9 @@
 // 一根灯条（最小外接旋转矩形的几何量 + 颜色纯度）
 struct LightBar {
   bool joinedFragments = false;
+  bool partial = false;
+  bool extrapolatedEndpoint = false;
+  bool extrapolatedTopEndpoint = false;
   cv::RotatedRect rect;
   cv::Point2f box[4]{};       // 旋转矩形 4 顶点
   cv::Point2f center{};       // 中心
@@ -22,6 +25,13 @@ struct LightBar {
 struct Armor {
   LightBar left, right;
   cv::Point2f corners[4]{};   // 左上 右上 右下 左下
+  bool inferredCorners[4]{};  // 被遮挡灯条端点推导出的角点
+  bool partialBarInferred = false;
+  cv::Point2f panelCorners[4]{};  // CLAHE-refined panel outline, separate from lightbar corners
+  bool panelOutlineValid = false;
+  bool panelDetectedEdges[4]{};   // top, right, bottom, left
+  bool panelDetectedCorners[4]{}; // top-left, top-right, bottom-right, bottom-left
+  float panelEdgeConfidence = 0.f;
   cv::Point2f center{};
   float lenDiff = 0.f;        // 左右灯条长度差 / 较长者
   float slope = 0.f;          // 两灯条中心连线斜率

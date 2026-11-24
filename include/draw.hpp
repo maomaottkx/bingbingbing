@@ -8,6 +8,8 @@
 
 // 画一块装甲板：4 条边 + 4 个彩色角点 + 中心十字。predicted=true 时画虚线并用橙色。
 void drawPlate(cv::Mat& img, const cv::Point2f corners[4], bool predicted);
+void drawInferredCorners(cv::Mat& img, const Armor& armor);
+void drawPanelOutline(cv::Mat& img, const Armor& armor);
 
 // 左上角 HUD 文本框，逐行写字。
 void drawHud(cv::Mat& img, const std::vector<std::string>& lines);

@@ -59,6 +59,40 @@ void drawPlate(cv::Mat& img, const cv::Point2f corners[4], bool predicted)
   cv::circle(img, c, 2, cv::Scalar(255, 255, 255), -1, cv::LINE_AA);
 }
 
+void drawPanelOutline(cv::Mat& img, const Armor& armor)
+{
+  if (!armor.panelOutlineValid) return;
+  const cv::Scalar estimatedColor(0, 165, 255);
+  const cv::Scalar detectedColor(255, 255, 0);
+  for (int i = 0; i < 4; ++i) {
+    const cv::Point2f a = armor.panelCorners[i];
+    const cv::Point2f b = armor.panelCorners[(i + 1) % 4];
+    if (armor.panelDetectedEdges[i])
+      cv::line(img, a, b, detectedColor, 2, cv::LINE_AA);
+    else
+      dashedLine(img, a, b, estimatedColor, 1, 7, 6);
+    if (armor.panelDetectedCorners[i])
+      cv::circle(img, a, 4, detectedColor, -1, cv::LINE_AA);
+  }
+
+  char label[48];
+  const int detected = static_cast<int>(std::count(
+      std::begin(armor.panelDetectedEdges), std::end(armor.panelDetectedEdges), true));
+  std::snprintf(label, sizeof(label), "PANEL EDGE %d/4", detected);
+  cv::putText(img, label, armor.panelCorners[0] + cv::Point2f(0, -8),
+              cv::FONT_HERSHEY_SIMPLEX, 0.5, detected ? detectedColor : estimatedColor,
+              1, cv::LINE_AA);
+}
+
+void drawInferredCorners(cv::Mat& img, const Armor& armor)
+{
+  const cv::Scalar inferredColor(0, 165, 255);
+  for (int i = 0; i < 4; ++i) {
+    if (!armor.inferredCorners[i]) continue;
+    cv::circle(img, armor.corners[i], 8, inferredColor, 2, cv::LINE_AA);
+  }
+}
+
 void drawHud(cv::Mat& img, const std::vector<std::string>& lines)
 {
   if (lines.empty()) return;

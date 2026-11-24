@@ -32,12 +32,14 @@ const std::vector<cv::Point3f>& objectPoints()
 
 cv::Mat cameraMatrix()
 {
-  return (cv::Mat_<double>(3, 3) << cfg::kFx, 0, cfg::kCx, 0, cfg::kFy, cfg::kCy, 0, 0, 1);
+  return (cv::Mat_<double>(3, 3) << cfg::g_cam.fx, 0, cfg::g_cam.cx, 0, cfg::g_cam.fy, cfg::g_cam.cy,
+          0, 0, 1);
 }
 
 cv::Mat distCoeffs()
 {
-  return (cv::Mat_<double>(5, 1) << cfg::kK1, cfg::kK2, cfg::kP1, cfg::kP2, cfg::kK3);
+  return (cv::Mat_<double>(5, 1) << cfg::g_cam.k1, cfg::g_cam.k2, cfg::g_cam.p1, cfg::g_cam.p2,
+          cfg::g_cam.k3);
 }
 
 }  // namespace

@@ -14,12 +14,27 @@ constexpr double kP1 = 0.0027903039462225331;
 constexpr double kP2 = -0.0007315334877910064;
 constexpr double kK3 = 0.0;
 
+// 运行时相机内参：默认取上面的标定值，可用 --camera 由考核包里的 intrinsics.yaml 覆盖
+struct CameraRuntime {
+  double fx = kFx;
+  double fy = kFy;
+  double cx = kCx;
+  double cy = kCy;
+  double k1 = kK1;
+  double k2 = kK2;
+  double p1 = kP1;
+  double p2 = kP2;
+  double k3 = kK3;
+};
+inline CameraRuntime g_cam;
+
 // ---------- 装甲板物理尺寸（mm）----------
-// 角点取在灯条外缘，因此：半宽 = 板外缘到板中心的距离；半高 = 灯条可见发光长度的一半
-constexpr double kHalfW = 63.5;
-constexpr double kHalfH = 25.0;
-// 改用灯条中线端点当角点时，半宽对应"两灯条中心距的一半"（127 mm 外缘减去灯条宽 12 mm）
-constexpr double kHalfWCenter = 57.5;
+// 考核文档给的是：小装甲板宽 135 mm、高 56 mm，高度取灯条长度。
+// 角点取在灯条外缘，所以半宽 = 135/2，半高 = 56/2。
+constexpr double kHalfW = 67.5;
+constexpr double kHalfH = 28.0;
+// 改用灯条中线端点当角点时，半宽扣掉灯条本体宽度（约 12 mm）
+constexpr double kHalfWCenter = 61.5;
 
 // ---------- 颜色掩膜 ----------
 constexpr int kRedH1Low = 0;

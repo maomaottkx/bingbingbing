@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -18,6 +20,7 @@ namespace {
 
 struct Options {
   std::string video;
+  std::string camera;   // 内参文件（考核包里的 calibration/intrinsics.yaml）
   std::string save;
   std::string snapshot;
   std::string maskOut;   // 单帧模式下把掩膜存成 PNG
@@ -117,6 +120,55 @@ void printTrace(long long frame, const DetectResult& dr, const Picked& pk, const
   std::printf("\",%d\n", upperHalf);
 }
 
+// 读考核包里的内参文件（普通 YAML，不是 OpenCV FileStorage 格式），覆盖默认内参
+bool loadCamera(const std::string& path)
+{
+  std::ifstream in(path);
+  if (!in) {
+    std::printf("打不开内参文件: %s\n", path.c_str());
+    return false;
+  }
+  std::vector<double> k, d;
+  std::string line;
+  auto grab = [&](const char* key, std::vector<double>& out) {
+    if (line.find(key) == std::string::npos) return;
+    const size_t lb = line.find('[');
+    const size_t rb = line.find(']');
+    if (lb == std::string::npos || rb == std::string::npos || rb < lb) return;
+    std::string body = line.substr(lb + 1, rb - lb - 1);
+    for (char& c : body) {
+      if (c == ',') c = ' ';
+    }
+    std::istringstream is(body);
+    std::vector<double> v;
+    double x = 0;
+    while (is >> x) v.push_back(x);
+    if (!v.empty()) out = v;
+  };
+  while (std::getline(in, line)) {
+    grab("camera_matrix", k);
+    grab("distort_coeffs", d);
+  }
+  if (k.size() != 9) {
+    std::printf("内参文件里没有 9 个数的 camera_matrix: %s\n", path.c_str());
+    return false;
+  }
+  cfg::g_cam.fx = k[0];
+  cfg::g_cam.cx = k[2];
+  cfg::g_cam.fy = k[4];
+  cfg::g_cam.cy = k[5];
+  if (d.size() >= 4) {
+    cfg::g_cam.k1 = d[0];
+    cfg::g_cam.k2 = d[1];
+    cfg::g_cam.p1 = d[2];
+    cfg::g_cam.p2 = d[3];
+  }
+  if (d.size() >= 5) cfg::g_cam.k3 = d[4];
+  std::printf("内参已载入 %s\n  fx=%.4f fy=%.4f cx=%.4f cy=%.4f\n", path.c_str(), cfg::g_cam.fx,
+              cfg::g_cam.fy, cfg::g_cam.cx, cfg::g_cam.cy);
+  return true;
+}
+
 void usage(const char* exe)
 {
   std::printf("用法: %s <视频路径> [选项]\n", exe);
@@ -128,6 +180,7 @@ void usage(const char* exe)
   std::printf("  --scale 0.5          输出视频缩放\n");
   std::printf("  --out-fps 30         输出视频帧率（默认跟原视频一致）\n");
   std::printf("  --compare            左右分屏：左=逐帧实测 右=跟踪结果\n");
+  std::printf("  --camera 路径        读考核包的内参文件（calibration/intrinsics.yaml）\n");
   std::printf("  --mask and|or        颜色掩膜方式（默认 or）\n");
   std::printf("  --debug              叠加灯条/候选/掩膜\n");
   std::printf("  --no-tracker         关掉跟踪，只看逐帧检测（做对比用）\n");
@@ -145,6 +198,8 @@ bool parseArgs(int argc, char** argv, Options& opt)
     };
     if (a == "--all") {
       continue;
+    } else if (a == "--camera") {
+      if (i + 1 < argc) opt.camera = argv[++i];
     } else if (a == "--limit") {
       if (i + 1 < argc) opt.limit = std::atoi(argv[++i]);
     } else if (a == "--frame") {
@@ -231,6 +286,7 @@ int main(int argc, char** argv)
 
   Options opt;
   if (!parseArgs(argc, argv, opt)) return 1;
+  if (!opt.camera.empty() && !loadCamera(opt.camera)) return 1;
 
   cv::VideoCapture cap(opt.video);
   if (!cap.isOpened()) {
@@ -286,7 +342,11 @@ int main(int argc, char** argv)
       cv::imwrite(opt.maskOut, dr.mask);
       std::printf("掩膜已存: %s\n", opt.maskOut.c_str());
     }
-    if (pk.found) drawPlate(frame, pk.armor.corners, false);
+    if (pk.found) {
+      drawPlate(frame, pk.armor.corners, false);
+      drawInferredCorners(frame, pk.armor);
+      drawPanelOutline(frame, pk.armor);
+    }
     char buf[256];
     std::vector<std::string> hud;
     hud.push_back("SINGLE FRAME " + std::to_string(opt.frame));
@@ -432,7 +492,11 @@ int main(int argc, char** argv)
     char buf[256];
     cv::Mat rawView = opt.compare ? frame.clone() : cv::Mat();
     if (!rawView.empty()) {
-      if (pk.found) drawPlate(rawView, pk.armor.corners, false);
+      if (pk.found) {
+        drawPlate(rawView, pk.armor.corners, false);
+        drawInferredCorners(rawView, pk.armor);
+        drawPanelOutline(rawView, pk.armor);
+      }
       std::vector<std::string> rawHud;
       rawHud.push_back("GEOMETRY PASS (shared selection)");
       std::snprintf(buf, sizeof(buf), "FRAME %lld   BARS %zu   CANDS %zu", nFrames,
@@ -449,6 +513,8 @@ int main(int argc, char** argv)
         drawPlate(frame, corners, true);
       } else if (pk.found) {
         drawPlate(frame, pk.armor.corners, false);
+        drawInferredCorners(frame, pk.armor);
+        drawPanelOutline(frame, pk.armor);
       }
     }
 
